@@ -1,0 +1,43 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.venv/
+venv/
+ENV/
+env/
+.env
+.vscode/
+.idea/
+.git/
+.agents/
+desktop.ini
+Thumbs.db
+
+# Keep folder categories but empty of data files:
+
+# 1. Clinical Trials & Pipeline Intelligence
+/Clinical Trials & Pipeline Intelligence/**
+!/Clinical Trials & Pipeline Intelligence/**/
+!/Clinical Trials & Pipeline Intelligence/**/.gitkeep
+
+# 2. Drug & Substance Reference
+/Drug & Substance Reference/**
+!/Drug & Substance Reference/**/
+!/Drug & Substance Reference/**/.gitkeep
+
+# 3. Regulatory & Approvals
+/Regulatory & Approvals/**
+!/Regulatory & Approvals/**/
+!/Regulatory & Approvals/**/.gitkeep
+
+# 4. Safety & Pharmacovigilance
+/Safety & Pharmacovigilance/**
+!/Safety & Pharmacovigilance/**/
+!/Safety & Pharmacovigilance/**/.gitkeep
+!/Safety & Pharmacovigilance/tests/**
+
+# Ignore scratch completely
+scratch/
+
