@@ -7,7 +7,9 @@ This workspace contains data scrapers, downloaders, and analysis scripts organiz
 - [Drug & Substance Reference](#drug-substance-reference)
 - [Regulatory & Approvals](#regulatory-approvals)
 - [Safety & Pharmacovigilance](#safety-pharmacovigilance)
+- [Ontologies & Standards](#ontologies-standards)
 - [Utility Scripts](#utility-scripts)
+
 
 ## Clinical Trials & Pipeline Intelligence
 *Scripts for crawling, downloading, and parsing clinical trial registry data.*
@@ -821,9 +823,65 @@ No command-line arguments (executed directly or as a helper utility).
 No command-line arguments (executed directly or as a helper utility).
 ```
 
+## Ontologies & Standards
+*Scripts for downloading and parsing medical ontologies and terminological standards.*
+
+### `mesh_downloader.py`
+- **Data Storage Folder**: `[data]/Ontologies & Standards/mesh_data`
+- **Description**: Connects to the official U.S. National Library of Medicine (NLM) MeSH server to download, extract, and parse XML datasets (Descriptors, Qualifiers, Pharmacological Actions, and Supplemental Concepts) into structured, queryable CSV files.
+
+**Usage and Parameters**:
+```text
+usage: mesh_downloader.py [-h] [--output-dir OUTPUT_DIR] [--year YEAR]
+                          [--include-scr] [--keep-raw] [--verbose]
+
+options:
+  -h, --help            show this help message and exit
+  --output-dir OUTPUT_DIR
+                        Directory to save downloaded files and CSV outputs
+                        (default: Ontologies & Standards/mesh_data)
+  --year YEAR           MeSH Production Year to download (default: 2026)
+  --include-scr         Include downloading and parsing Supplemental Concept
+                        Records (SCR). WARNING: Large download/dataset.
+  --keep-raw            Keep raw XML and ZIP files after processing (default:
+                        False/cleanup)
+  --verbose             Enable verbose DEBUG logging
+```
+
+---
+
+### `nci_thesaurus_downloader.py`
+- **Data Storage Folder**: `[data]/Ontologies & Standards/nci_thesaurus_data`
+- **Description**: Connects to the official NCI EVS server to download and parse the NCI Thesaurus (NCIt) core flat file, CUI mappings, ontology mappings, neoplasm core data, and drug lists into structured, queryable CSV files. It features progress tracking and resumable downloads.
+
+**Usage and Parameters**:
+```text
+usage: nci_thesaurus_downloader.py [-h] [--output-dir OUTPUT_DIR] [--keep-raw]
+                                   [--download-only] [--process-only]
+                                   [--skip-mappings] [--skip-neoplasm]
+                                   [--skip-drugs] [--verbose]
+
+options:
+  -h, --help            show this help message and exit
+  --output-dir OUTPUT_DIR
+                        Directory to save downloaded files and CSV outputs
+                        (default: Ontologies & Standards/nci_thesaurus_data)
+  --keep-raw            Keep raw download files (ZIP, TXT, DAT, CSV) after parsing
+                        (default: delete/cleanup)
+  --download-only       Only download the raw database files, do not parse them
+  --process-only        Only parse local raw database files if already downloaded,
+                        do not fetch from server
+  --skip-mappings       Skip downloading and processing external mappings (HGNC,
+                        ChEBI, SwissProt, GO)
+  --skip-neoplasm       Skip downloading and processing Neoplasm Core subsets
+  --skip-drugs          Skip downloading and processing Drug/Substance subsets
+  --verbose             Enable verbose DEBUG logging
+```
+
 ---
 
 ## Utility Scripts
+
 *General purpose utility scripts for workspace management and deployment.*
 
 ### `upload_to_s3.py`

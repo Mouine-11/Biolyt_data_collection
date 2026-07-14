@@ -38,6 +38,21 @@ Thumbs.db
 !/Safety & Pharmacovigilance/**/.gitkeep
 !/Safety & Pharmacovigilance/tests/**
 
+# 5. Ontologies & Standards
+/Ontologies & Standards/**
+!/Ontologies & Standards/**/
+!/Ontologies & Standards/**/.gitkeep
+
+# 6. Literature & Evidence
+/Literature & Evidence/**
+!/Literature & Evidence/**/
+!/Literature & Evidence/**/.gitkeep
+
 # Ignore scratch completely
 scratch/
+
+# Log files
+*.log
+
+
 

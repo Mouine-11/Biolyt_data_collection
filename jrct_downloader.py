@@ -23,10 +23,13 @@ import sys
 import time
 import argparse
 import csv
+import random
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode
 import requests
 from bs4 import BeautifulSoup
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Reconfigure output encoding for UTF-8 compatibility on Windows terminal
 try:
@@ -41,136 +44,208 @@ class BlockedException(Exception):
     pass
 
 
-# A rotation pool of modern desktop browsers to bypass User-Agent fingerprinting
-USER_AGENTS = [
-    # Chrome on Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    # Chrome on macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    # Firefox on Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
-    # Safari on macOS
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
-    # Edge on Windows
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
-]
-
-
-def get_random_headers(referer=None):
+class FetchException(Exception):
     """
-    Generates realistic, browser-complete headers with a random User-Agent and Sec-Ch-Ua attributes.
-    Optionally attaches a Referer header to simulate page navigation.
+    Raised when a page fails to load due to HTTP errors other than blocking (e.g. 500, 404).
     """
-    import random
-    ua = random.choice(USER_AGENTS)
-    
-    # Determine Sec-Ch-Ua based on User-Agent
-    if "Edg/" in ua:
-        sec_ua = '"Edge";v="124", "Chromium";v="124", "Not-A.Brand";v="99"'
-    elif "Chrome" in ua:
-        sec_ua = '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"'
-    else:
-        sec_ua = None
-
-    headers = {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin" if referer else "none",
-        "Sec-Fetch-User": "?1",
-        "DNT": "1"
-    }
-    
-    if sec_ua:
-        headers["Sec-Ch-Ua"] = sec_ua
-        headers["Sec-Ch-Ua-Mobile"] = "?0"
-        headers["Sec-Ch-Ua-Platform"] = '"Windows"' if "Windows" in ua else '"macOS"'
-        
-    if referer:
-        headers["Referer"] = referer
-        
-    return headers
+    pass
 
 
-DEFAULT_SEARCH_URL = "https://jrct.mhlw.go.jp/search?language=en&searched=1&page=1&dis_op=0&free_op=1"
+# Try to dynamically load curl_cffi for TLS impersonation bypasses
+try:
+    from curl_cffi import requests as requests_cffi
+except ImportError:
+    requests_cffi = None
 
-
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Global synchronization lock for modifying proxy pool or executing VPN rotation
 rotation_lock = threading.Lock()
 last_vpn_rotation_time = 0.0
 
+# Thread-local storage to hold persistent sessions for each worker thread
+thread_local = threading.local()
 
-def fetch_with_retry(session, url, proxies_list=None, vpn_rotate_cmd=None, retries=3, backoff=5, timeout=60, referer=None):
+
+# Define Browser Profiles containing matching TLS fingerprints, User-Agents, and headers
+BROWSER_PROFILES = [
+    {
+        "name": "Chrome (Windows)",
+        "impersonate": "chrome",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "headers": {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "DNT": "1",
+            "Sec-Ch-Ua": '"Google Chrome";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"'
+        }
+    },
+    {
+        "name": "Firefox (Windows)",
+        "impersonate": "firefox",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "headers": {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5,ja;q=0.3",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "DNT": "1"
+        }
+    },
+    {
+        "name": "Edge (Windows)",
+        "impersonate": "edge",
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+        "headers": {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "DNT": "1",
+            "Sec-Ch-Ua": '"Edge";v="124", "Chromium";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"'
+        }
+    },
+    {
+        "name": "Safari (macOS)",
+        "impersonate": "safari",
+        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+        "headers": {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,ja;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none"
+        }
+    }
+]
+
+
+def build_profile_session(profile, proxy=None, impersonate_enabled=True):
+    """
+    Creates and configures a session object (curl_cffi or standard requests)
+    pre-configured with specific browser profile headers and TLS fingerprints.
+    """
+    if impersonate_enabled and requests_cffi:
+        session = requests_cffi.Session()
+        session.impersonate = profile["impersonate"]
+    else:
+        session = requests.Session()
+        
+    # Copy headers into session
+    headers = profile["headers"].copy()
+    headers["User-Agent"] = profile["user_agent"]
+    session.headers.update(headers)
+    
+    if proxy:
+        session.proxies = {
+            "http": proxy,
+            "https": proxy
+        }
+    return session
+
+
+def get_thread_session(proxies_list=None, impersonate_enabled=True, static_proxy=None):
+    """
+    Retrieves or initializes a thread-local persistent Session.
+    Ensures that each concurrent thread acts as a unique browser instance.
+    """
+    if not hasattr(thread_local, "session"):
+        profile = random.choice(BROWSER_PROFILES)
+        proxy = static_proxy
+        if not proxy and proxies_list:
+            with rotation_lock:
+                if proxies_list:
+                    proxy = random.choice(proxies_list)
+        
+        session = build_profile_session(profile, proxy, impersonate_enabled)
+        thread_local.session = session
+        thread_local.profile = profile
+        thread_local.proxy = proxy
+        print(f"  [Thread {threading.current_thread().name}] Spawned independent session: {profile['name']} (Proxy: {proxy})")
+    return thread_local.session
+
+
+DEFAULT_SEARCH_URL = "https://jrct.mhlw.go.jp/search?language=en&searched=1&page=1&dis_op=0&free_op=1"
+
+
+def fetch_with_retry(session, url, proxies_list=None, vpn_rotate_cmd=None, retries=3, backoff=5, timeout=60, referer=None, cool_down=300):
     """
     Fetches a URL with a retry mechanism, exponential backoff, optional proxy rotation, or VPN rotation.
     When a proxy pool is active, dynamically retries across as many proxies as needed.
     This function is thread-safe and can be called concurrently.
     Mimics a real browser by generating realistic dynamic headers and introducing jitter to avoid WAF blocks.
     """
-    import random
     global last_vpn_rotation_time
     
-    # Introduce a small random jitter before initiating request to spread out concurrent threads
-    # This prevents the WAF from seeing multiple requests hitting the server at the exact same millisecond.
-    time.sleep(random.uniform(0.1, 2.5))
+    # Introduce a random delay between 7.0 and 15.0 seconds as requested by the user
+    sleep_time = random.uniform(7.0, 15.0)
+    print(f"      Sleeping {sleep_time:.2f} seconds before request...")
+    time.sleep(sleep_time)
     
     # When a proxy pool is active, try every proxy in the pool before giving up
-    effective_retries = len(proxies_list) if proxies_list else retries
+    effective_retries = max(retries, 3)
+    if proxies_list:
+        effective_retries = max(effective_retries, len(proxies_list))
+
+    last_status_code = None
 
     for attempt in range(1, effective_retries + 1):
-        current_proxy = None
-        if proxies_list:
-            # We select a random proxy but do not modify the session.proxies attribute.
-            # Instead, we pass it directly to the get() request to keep it thread-safe.
-            with rotation_lock:
-                if proxies_list:
-                    current_proxy = random.choice(proxies_list)
-            
-            if not current_proxy:
-                effective_retries = attempt - 1
-                break
-                
-            # Shorter per-proxy timeout so dead proxies fail fast
-            effective_timeout = min(timeout, 15)
-            # Small random jitter so successive proxy attempts look less robotic to the WAF
-            if attempt > 1:
-                time.sleep(random.uniform(0.5, 2.0))
-            print(f"  [Proxy {attempt}/{effective_retries}] Using proxy: {current_proxy}")
+        if referer:
+            session.headers["Referer"] = referer
         else:
-            effective_timeout = timeout
+            session.headers.pop("Referer", None)
             
         try:
-            # Generate a fresh set of realistic headers for this request, mimicking a real browser
-            headers = get_random_headers(referer=referer)
+            # Shorter per-proxy timeout so dead proxies fail fast
+            effective_timeout = min(timeout, 5) if (proxies_list or session.proxies) else timeout
             
-            # Pass proxy at the request level to ensure thread safety
-            proxies_dict = {"http": current_proxy, "https": current_proxy} if current_proxy else None
-            resp = session.get(url, headers=headers, timeout=effective_timeout, proxies=proxies_dict)
+            resp = session.get(url, timeout=effective_timeout)
+            last_status_code = resp.status_code
             if resp.status_code == 200:
                 return resp
             print(f"  [!] HTTP {resp.status_code} on attempt {attempt}/{effective_retries} for {url}")
             
             # WAF/Rate limit block
             if resp.status_code in [403, 429]:
-                if proxies_list:
-                    print("      Access denied (403/429). Rotating proxy...")
+                current_proxy = session.proxies.get("http") if session.proxies else None
+                if current_proxy and proxies_list:
+                    print(f"      [Thread {threading.current_thread().name}] Proxy {current_proxy} blocked (403/429). Rotating proxy...")
                     with rotation_lock:
                         try:
-                            proxies_list.remove(current_proxy)
-                            print(f"      Removed blocked proxy. {len(proxies_list)} remaining.")
+                            if current_proxy in proxies_list:
+                                proxies_list.remove(current_proxy)
+                                print(f"      Removed blocked proxy. {len(proxies_list)} remaining.")
                         except ValueError:
                             pass
+                        if proxies_list:
+                            new_proxy = random.choice(proxies_list)
+                            session.proxies = {"http": new_proxy, "https": new_proxy}
+                            print(f"      Assigned new proxy to thread: {new_proxy}")
+                        else:
+                            session.proxies = {}
                 elif vpn_rotate_cmd:
                     print(f"      Access denied (403/429). Executing VPN rotation...")
                     import subprocess
@@ -187,18 +262,25 @@ def fetch_with_retry(session, url, proxies_list=None, vpn_rotate_cmd=None, retri
                         else:
                             print("      VPN was recently rotated by another thread. Skipping duplicate rotation.")
                 else:
-                    raise BlockedException("The server has blocked your IP address (HTTP 403/429).")
+                    print(f"      [Thread {threading.current_thread().name}] WAF Block detected (403/429) on attempt {attempt}/{effective_retries}. cooling down for {cool_down}s...")
+                    time.sleep(cool_down)
                 
-        except BlockedException:
-            raise
         except Exception as e:
-            if proxies_list:
+            current_proxy = session.proxies.get("http") if session.proxies else None
+            if current_proxy and proxies_list:
+                print(f"      [Thread {threading.current_thread().name}] Connection error with proxy {current_proxy}: {e}. Rotating proxy...")
                 with rotation_lock:
                     try:
-                        proxies_list.remove(current_proxy)
-                        print(f"      Dead proxy removed. {len(proxies_list)} remaining. Rotating...")
+                        if current_proxy in proxies_list:
+                            proxies_list.remove(current_proxy)
+                            print(f"      Dead proxy removed. {len(proxies_list)} remaining.")
                     except ValueError:
                         pass
+                    if proxies_list:
+                        new_proxy = random.choice(proxies_list)
+                        session.proxies = {"http": new_proxy, "https": new_proxy}
+                    else:
+                        session.proxies = {}
             elif vpn_rotate_cmd:
                 print(f"      Connection failure. Executing VPN rotation...")
                 import subprocess
@@ -222,7 +304,12 @@ def fetch_with_retry(session, url, proxies_list=None, vpn_rotate_cmd=None, retri
                     time.sleep(sleep_time)
             continue
 
-    raise BlockedException("Exhausted all proxies/retries without a successful response.")
+    if last_status_code in [403, 429]:
+        raise BlockedException(f"The server blocked access (HTTP {last_status_code}).")
+    elif last_status_code:
+        raise FetchException(f"Server returned HTTP {last_status_code}.")
+    else:
+        raise FetchException("Exhausted all retries due to connection errors.")
 
 
 def parse_html_table(table):
@@ -261,7 +348,7 @@ def parse_html_table(table):
     return [[cell or '' for cell in row] for row in grid]
 
 
-def scrape_search_page(session, base_url, page_num, proxies_list=None, vpn_rotate_cmd=None, timeout=60):
+def scrape_search_page(session, base_url, page_num, proxies_list=None, vpn_rotate_cmd=None, timeout=60, impersonate_enabled=True, cool_down=300, static_proxy=None):
     """
     Scrapes a search result listing page and extracts Trial IDs.
     Simulates organic referer navigation.
@@ -278,10 +365,15 @@ def scrape_search_page(session, base_url, page_num, proxies_list=None, vpn_rotat
     referer = "https://jrct.mhlw.go.jp/" if page_num == 1 else f"https://jrct.mhlw.go.jp/search?language=en&searched=1&page={page_num-1}&dis_op=0&free_op=1"
     
     print(f"\n[Search Page {page_num}] Fetching list: {page_url}")
-    resp = fetch_with_retry(session, page_url, proxies_list=proxies_list, vpn_rotate_cmd=vpn_rotate_cmd, timeout=timeout, referer=referer)
+    sess = session or get_thread_session(proxies_list, impersonate_enabled, static_proxy)
+    try:
+        resp = fetch_with_retry(sess, page_url, proxies_list=proxies_list, vpn_rotate_cmd=vpn_rotate_cmd, timeout=timeout, referer=referer, cool_down=cool_down)
+    except FetchException as fe:
+        print(f"  [Error] Search page {page_num} failed with error: {fe}")
+        return None
     if not resp:
         print(f"  [Error] Failed to load search page {page_num}")
-        return []
+        return None
         
     soup = BeautifulSoup(resp.text, "html.parser")
     table = soup.find("table")
@@ -304,14 +396,21 @@ def scrape_search_page(session, base_url, page_num, proxies_list=None, vpn_rotat
     return trial_ids
 
 
-def scrape_detail_page(session, trial_id, proxies_list=None, vpn_rotate_cmd=None, timeout=60, referer="https://jrct.mhlw.go.jp/search?language=en&searched=1&page=1&dis_op=0&free_op=1"):
+def scrape_detail_page(session, trial_id, proxies_list=None, vpn_rotate_cmd=None, timeout=60, referer="https://jrct.mhlw.go.jp/search?language=en&searched=1&page=1&dis_op=0&free_op=1", impersonate_enabled=True, cool_down=300, static_proxy=None):
     """
     Downloads and parses a trial's detail page, converting structured
     tables into flat key-value pairs.
     Simulates organic referer navigation from the search listings page.
     """
     detail_url = f"https://jrct.mhlw.go.jp/en-latest-detail/{trial_id}"
-    resp = fetch_with_retry(session, detail_url, proxies_list=proxies_list, vpn_rotate_cmd=vpn_rotate_cmd, timeout=timeout, referer=referer)
+    sess = session or get_thread_session(proxies_list, impersonate_enabled, static_proxy)
+    try:
+        from urllib.parse import quote
+        safe_detail_url = f"https://jrct.mhlw.go.jp/en-latest-detail/{quote(trial_id)}"
+        resp = fetch_with_retry(sess, safe_detail_url, proxies_list=proxies_list, vpn_rotate_cmd=vpn_rotate_cmd, timeout=timeout, referer=referer, cool_down=cool_down)
+    except FetchException as fe:
+        print(f"  [Warning] Trial {trial_id} detail page failed with error: {fe}. Skipping record.")
+        return None
     if not resp:
         print(f"  [Error] Failed to fetch details for {trial_id}")
         return None
@@ -379,13 +478,26 @@ def test_proxy(proxy, test_url="https://jrct.mhlw.go.jp/", timeout=5):
     """
     Tests a single proxy with a fast timeout. Returns the proxy string if it works, else None.
     """
+    profile = random.choice(BROWSER_PROFILES)
+    headers = profile["headers"].copy()
+    headers["User-Agent"] = profile["user_agent"]
+    
     try:
-        resp = requests.get(
-            test_url,
-            proxies={"http": proxy, "https": proxy},
-            headers=HEADERS,
-            timeout=timeout
-        )
+        if requests_cffi:
+            resp = requests_cffi.get(
+                test_url,
+                proxies={"http": proxy, "https": proxy},
+                headers=headers,
+                impersonate=profile["impersonate"],
+                timeout=timeout
+            )
+        else:
+            resp = requests.get(
+                test_url,
+                proxies={"http": proxy, "https": proxy},
+                headers=headers,
+                timeout=timeout
+            )
         # Only accept genuine success/redirect — 403/429 means proxy IP is already blocked by jRCT
         if resp.status_code in [200, 301, 302]:
             return proxy
@@ -512,6 +624,17 @@ def main():
         default=None,
         help="Shell command to run to rotate your VPN IP address when blocked (e.g. 'nordvpn connect')."
     )
+    parser.add_argument(
+        "--no-impersonate",
+        action="store_true",
+        help="Force standard requests library instead of curl_cffi impersonation."
+    )
+    parser.add_argument(
+        "--cool-down",
+        type=int,
+        default=300,
+        help="Cool-down wait time in seconds when WAF blocks requests (default: 300s)."
+    )
 
     args = parser.parse_args()
 
@@ -522,6 +645,7 @@ def main():
     # Load existing records for resume functionality
     existing_records = []
     scraped_ids = set()
+    skipped_ids = set()
     if csv_path.exists():
         try:
             with open(csv_path, "r", encoding="utf-8") as f:
@@ -543,6 +667,11 @@ def main():
     print(f"  Output CSV         : {csv_path}")
     print(f"  Polite Delay       : {args.delay}s")
     print(f"  Timeout            : {args.timeout}s")
+    if requests_cffi and not args.no_impersonate:
+        print("  TLS Impersonation  : Enabled (using curl_cffi)")
+    else:
+        print("  TLS Impersonation  : Disabled (using standard requests)")
+    print(f"  Cool-down Time     : {args.cool_down}s")
     if args.max_pages:
         print(f"  Max Search Pages   : {args.max_pages} (~{args.max_pages * 50} trials)")
     if args.max_trials:
@@ -573,18 +702,12 @@ def main():
     seen = set()
     proxies_list = [p for p in proxies_list if not (p in seen or seen.add(p))]
 
-    session = requests.Session()
     static_proxy = None
     
     # If using a single static proxy, store it to apply to subsequent fresh sessions
     if len(proxies_list) == 1:
         static_proxy = proxies_list[0]
-        session.proxies = {
-            "http": static_proxy,
-            "https": static_proxy
-        }
         print(f"Configured static proxy: {static_proxy}")
-        proxies_list = []  # Empty it to disable rotation logic
 
     all_trial_ids = []
     ids_cache_path = output_dir / "jrct_ids.txt"  # Persisted ID list for resume
@@ -662,11 +785,20 @@ def main():
             print(f"    [Save Error] Failed to write CSV file: {csv_err}")
 
     # Special initialization if starting completely fresh
-    # The user said: "After collecting the first page unique identifier, then, waiting, of course, we wait for 5 seconds, then we will do those requests."
     if not ids_collection_complete and len(all_trial_ids) == 0:
         print("\n>>> Fresh Start: Fetching Search Page 1 to discover initial Trial IDs...")
         try:
-            page_ids = scrape_search_page(session, args.url, 1, proxies_list=proxies_list, vpn_rotate_cmd=args.vpn_rotate, timeout=args.timeout)
+            page_ids = scrape_search_page(
+                None,
+                args.url,
+                1,
+                proxies_list=proxies_list,
+                vpn_rotate_cmd=args.vpn_rotate,
+                timeout=args.timeout,
+                impersonate_enabled=(not args.no_impersonate),
+                cool_down=args.cool_down,
+                static_proxy=static_proxy
+            )
             if page_ids:
                 all_trial_ids.extend(page_ids)
                 print(f"    Collected {len(page_ids)} initial Trial IDs from Page 1.")
@@ -688,15 +820,8 @@ def main():
     try:
         batch_index = 1
         while True:
-            # Recreate session for each batch to avoid WAF session-tracking fingerprints
-            session = requests.Session()
-            if static_proxy:
-                session.proxies = {
-                    "http": static_proxy,
-                    "https": static_proxy
-                }
             # Determine which trials need to be fetched in this batch
-            unscraped_ids = [tid for tid in all_trial_ids if tid not in scraped_ids]
+            unscraped_ids = [tid for tid in all_trial_ids if tid not in scraped_ids and tid not in skipped_ids]
             
             # Apply max_trials limit if specified
             if args.max_trials:
@@ -712,9 +837,6 @@ def main():
             batch_to_fetch = unscraped_ids[:args.batch_size]
             
             # Determine if we should also request the next search page
-            # We fetch next search page if:
-            # 1. We haven't finished search pagination, AND
-            # 2. (We are not limited by max_pages, OR the next search page is within max_pages limit)
             fetch_search = False
             if not ids_collection_complete:
                 if not args.max_pages or search_page <= args.max_pages:
@@ -726,79 +848,141 @@ def main():
                         f.write("\n".join(all_trial_ids) + "\n__COMPLETE__")
 
             # Check termination condition:
-            # - No more un-scraped detail pages in the queue, AND
-            # - No more search pages to fetch
             if not batch_to_fetch and not fetch_search:
                 print("\n>>> All trials have been successfully scraped and search collection is complete.")
                 break
 
-            print(f"\n>>> [Batch {batch_index}] Processing concurrent requests...")
-            if fetch_search:
-                print(f"    - Concurrently requesting Search Page {search_page}")
-            if batch_to_fetch:
-                print(f"    - Concurrently requesting {len(batch_to_fetch)} trial details: {', '.join(batch_to_fetch)}")
-
-            # Execute requests concurrently using a ThreadPoolExecutor
-            # Workers is up to 11 (1 search + 10 details)
-            max_workers = (1 if fetch_search else 0) + len(batch_to_fetch)
-            
-            new_page_ids = None
-            scraped_details_batch = []
-            search_blocked = False
-            detail_blocked = False
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures_detail = {}
-                future_search = None
-                
-                # Submit search page task
+            if args.batch_size == 1:
+                print(f"\n>>> [Batch {batch_index}] Processing sequential request...")
                 if fetch_search:
-                    future_search = executor.submit(
-                        scrape_search_page,
-                        session,
-                        args.url,
-                        search_page,
-                        proxies_list=proxies_list,
-                        vpn_rotate_cmd=args.vpn_rotate,
-                        timeout=args.timeout
-                    )
-                
-                # Submit detail page tasks
-                for trial_id in batch_to_fetch:
-                    future = executor.submit(
-                        scrape_detail_page,
-                        session,
-                        trial_id,
-                        proxies_list=proxies_list,
-                        vpn_rotate_cmd=args.vpn_rotate,
-                        timeout=args.timeout
-                    )
-                    futures_detail[future] = trial_id
+                    print(f"    - Requesting Search Page {search_page}")
+                if batch_to_fetch:
+                    print(f"    - Requesting trial details: {', '.join(batch_to_fetch)}")
 
-                # Wait for search page task to complete if submitted
-                if future_search:
+                new_page_ids = None
+                scraped_details_batch = []
+                search_blocked = False
+                detail_blocked = False
+
+                if fetch_search:
                     try:
-                        new_page_ids = future_search.result()
+                        new_page_ids = scrape_search_page(
+                            None,
+                            args.url,
+                            search_page,
+                            proxies_list=proxies_list,
+                            vpn_rotate_cmd=args.vpn_rotate,
+                            timeout=args.timeout,
+                            impersonate_enabled=(not args.no_impersonate),
+                            cool_down=args.cool_down,
+                            static_proxy=static_proxy
+                        )
                     except BlockedException as e:
                         search_blocked = True
                         print(f"    [Block] Search page {search_page} hit a block exception.")
                     except Exception as e:
                         print(f"    [Error] Search page {search_page} failed: {e}")
 
-                # Wait for detail page tasks to complete
-                for future in as_completed(futures_detail):
-                    trial_id = futures_detail[future]
+                for trial_id in batch_to_fetch:
                     try:
-                        trial_data = future.result()
+                        trial_data = scrape_detail_page(
+                            None,
+                            trial_id,
+                            proxies_list=proxies_list,
+                            vpn_rotate_cmd=args.vpn_rotate,
+                            timeout=args.timeout,
+                            referer=args.url,
+                            impersonate_enabled=(not args.no_impersonate),
+                            cool_down=args.cool_down,
+                            static_proxy=static_proxy
+                        )
                         if trial_data:
                             scraped_details_batch.append(trial_data)
                         else:
                             print(f"    [Warning] Failed to scrape details for {trial_id}.")
+                            skipped_ids.add(trial_id)
                     except BlockedException as e:
                         detail_blocked = True
                         print(f"    [Block] Trial {trial_id} detail page hit a block exception.")
                     except Exception as e:
                         print(f"    [Error] Trial {trial_id} detail page failed: {e}")
+                        skipped_ids.add(trial_id)
+            else:
+                print(f"\n>>> [Batch {batch_index}] Processing concurrent requests...")
+                if fetch_search:
+                    print(f"    - Concurrently requesting Search Page {search_page}")
+                if batch_to_fetch:
+                    print(f"    - Concurrently requesting {len(batch_to_fetch)} trial details: {', '.join(batch_to_fetch)}")
+
+                # Execute requests concurrently using a ThreadPoolExecutor
+                max_workers = (1 if fetch_search else 0) + len(batch_to_fetch)
+                
+                new_page_ids = None
+                scraped_details_batch = []
+                search_blocked = False
+                detail_blocked = False
+
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures_detail = {}
+                    future_search = None
+                    
+                    # Submit search page task
+                    if fetch_search:
+                        future_search = executor.submit(
+                            scrape_search_page,
+                            None,
+                            args.url,
+                            search_page,
+                            proxies_list=proxies_list,
+                            vpn_rotate_cmd=args.vpn_rotate,
+                            timeout=args.timeout,
+                            impersonate_enabled=(not args.no_impersonate),
+                            cool_down=args.cool_down,
+                            static_proxy=static_proxy
+                        )
+                    
+                    # Submit detail page tasks
+                    for trial_id in batch_to_fetch:
+                        future = executor.submit(
+                            scrape_detail_page,
+                            None,
+                            trial_id,
+                            proxies_list=proxies_list,
+                            vpn_rotate_cmd=args.vpn_rotate,
+                            timeout=args.timeout,
+                            referer=args.url,
+                            impersonate_enabled=(not args.no_impersonate),
+                            cool_down=args.cool_down,
+                            static_proxy=static_proxy
+                        )
+                        futures_detail[future] = trial_id
+
+                    # Wait for search page task to complete if submitted
+                    if future_search:
+                        try:
+                            new_page_ids = future_search.result()
+                        except BlockedException as e:
+                            search_blocked = True
+                            print(f"    [Block] Search page {search_page} hit a block exception.")
+                        except Exception as e:
+                            print(f"    [Error] Search page {search_page} failed: {e}")
+
+                    # Wait for detail page tasks to complete
+                    for future in as_completed(futures_detail):
+                        trial_id = futures_detail[future]
+                        try:
+                            trial_data = future.result()
+                            if trial_data:
+                                scraped_details_batch.append(trial_data)
+                            else:
+                                print(f"    [Warning] Failed to scrape details for {trial_id}.")
+                                skipped_ids.add(trial_id)
+                        except BlockedException as e:
+                            detail_blocked = True
+                            print(f"    [Block] Trial {trial_id} detail page hit a block exception.")
+                        except Exception as e:
+                            print(f"    [Error] Trial {trial_id} detail page failed: {e}")
+                            skipped_ids.add(trial_id)
 
             # Process search page results
             if fetch_search and not search_blocked:
@@ -813,7 +997,7 @@ def main():
                         f.write("\n".join(all_trial_ids))
                         
                     search_page += 1
-                elif new_page_ids is not None:
+                elif new_page_ids == []:
                     # Returned empty list, meaning end of search pagination
                     print(f"    [Search Page {search_page}] No more Trial IDs found. Search collection complete.")
                     ids_collection_complete = True
@@ -824,7 +1008,6 @@ def main():
             if scraped_details_batch:
                 all_scraped_records.extend(scraped_details_batch)
                 scraped_ids.update({trial.get("Trial ID") for trial in scraped_details_batch if trial.get("Trial ID")})
-                # Save immediately to CSV (10 by 10)
                 save_csv()
 
             # Handle blocks with a smart, resilient failover strategy
@@ -847,9 +1030,14 @@ def main():
                     break
 
             # Polite wait delay after the batch completes
-            wait_time = max(args.delay, 5.0)
-            print(f"    Waiting {wait_time} seconds before repeating...")
-            time.sleep(wait_time)
+            if args.batch_size == 1:
+                wait_time = 0.0
+            else:
+                wait_time = max(args.delay, 5.0)
+                
+            if wait_time > 0:
+                print(f"    Waiting {wait_time} seconds before repeating...")
+                time.sleep(wait_time)
             batch_index += 1
 
     except KeyboardInterrupt:

@@ -45,6 +45,15 @@ from requests.adapters import HTTPAdapter
 from urllib3.util import Retry
 from bs4 import BeautifulSoup
 import pandas as pd
+import io
+
+try:
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:
+    boto3 = None
+    BotoCoreError = Exception
+    ClientError = Exception
 
 # Optional progress bar
 try:
@@ -118,11 +127,21 @@ def extract_language_and_type(url: str) -> tuple:
     
     return lang, doc_type
 
+class SafeRetry(Retry):
+    def parse_retry_after(self, retry_after):
+        try:
+            return super().parse_retry_after(retry_after)
+        except Exception:
+            try:
+                return float(retry_after)
+            except ValueError:
+                return 1.0
+
 # -- HTTP Session Builder ----------------------------------------------------
 def build_session(max_retries: int) -> requests.Session:
     """Builds a requests.Session mimicking a browser with exponential backoff retries."""
     session = requests.Session()
-    retry_strategy = Retry(
+    retry_strategy = SafeRetry(
         total=max_retries,
         backoff_factor=2.0,
         status_forcelist=[429, 500, 502, 503, 504],
@@ -231,7 +250,7 @@ class DatabaseManager:
             
         columns_str = ", ".join(clean_columns)
         placeholders = ", ".join(["?"] * len(clean_columns))
-        query = f"INSERT OR REPLACE INTO medicines ({columns_str}) VALUES ({placeholders});"
+        query = f"INSERT OR IGNORE INTO medicines ({columns_str}) VALUES ({placeholders});"
         
         rows = [tuple(r) for r in df_clean.values]
         
@@ -351,11 +370,16 @@ class DatabaseManager:
 # -- Core Downloader Logic ---------------------------------------------------
 class EMADataCollector:
     """Manages downloading the master Excel and crawling individual medicine EPAR pages."""
-    def __init__(self, db: DatabaseManager, session: requests.Session, output_dir: Path, languages: list):
+    def __init__(self, db: DatabaseManager, session: requests.Session, output_dir: Path, languages: list,
+                 s3_client=None, s3_bucket=None, s3_prefix=None, s3_direct=False):
         self.db = db
         self.session = session
         self.output_dir = output_dir
         self.languages = languages  # e.g., ['en'] or ['en', 'fr'] or ['all']
+        self.s3_client = s3_client
+        self.s3_bucket = s3_bucket
+        self.s3_prefix = s3_prefix
+        self.s3_direct = s3_direct
 
     def download_and_parse_master(self) -> bool:
         """Downloads the main EMA medicines Excel database and imports it into SQLite."""
@@ -406,6 +430,21 @@ class EMADataCollector:
             csv_path = self.output_dir / "ema_medicines.csv"
             df.to_csv(csv_path, index=False, encoding='utf-8')
             log.info(f"Exported clean medicines metadata to CSV: {csv_path}")
+            
+            if self.s3_direct:
+                csv_key = f"{self.s3_prefix}/ema_medicines.csv".replace('\\', '/').lstrip('/')
+                try:
+                    log.info(f"Uploading ema_medicines.csv to S3: s3://{self.s3_bucket}/{csv_key}")
+                    self.s3_client.upload_file(str(csv_path), self.s3_bucket, csv_key)
+                    log.info("Uploaded ema_medicines.csv to S3 successfully.")
+                    csv_path.unlink()
+                except Exception as e:
+                    log.error(f"Failed to upload ema_medicines.csv to S3: {e}")
+                
+                # Delete local master Excel file to keep local storage clean
+                if excel_path.exists():
+                    excel_path.unlink()
+                    log.info("Removed temporary local copy of medicines_report.xlsx.")
             
             return True
         except Exception as e:
@@ -531,54 +570,113 @@ class EMADataCollector:
 # -- PDF Downloader Logic ----------------------------------------------------
 class EMAPDFDownloader:
     """Manages downloading PDF documents from the queue with atomic writes and retries."""
-    def __init__(self, db: DatabaseManager, session: requests.Session, output_dir: Path):
+    def __init__(self, db: DatabaseManager, session: requests.Session, output_dir: Path,
+                 s3_client=None, s3_bucket=None, s3_prefix=None, s3_direct=False):
         self.db = db
         self.session = session
         self.output_dir = output_dir
+        self.s3_client = s3_client
+        self.s3_bucket = s3_bucket
+        self.s3_prefix = s3_prefix
+        self.s3_direct = s3_direct
 
     def download_file(self, url: str, rel_path: str, referer: str) -> bool:
-        """Downloads a single PDF to a .tmp file, and atomically renames it on success, using a Referer header."""
-        local_path = self.output_dir / rel_path
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Skip if already exists and not empty
-        if local_path.exists() and local_path.stat().st_size > 0:
-            log.info(f"File already exists: {rel_path}. Skipping.")
-            self.db.update_download_status(url, 'completed', local_path.stat().st_size)
-            return True
-            
-        log.info(f"Downloading PDF: {url} -> {rel_path}")
-        tmp_path = local_path.with_suffix(".tmp")
-        
-        try:
-            headers = {}
-            if referer:
-                headers["Referer"] = referer
+        """Downloads a single PDF, streaming to S3 directly or saving locally using a Referer header."""
+        if self.s3_direct:
+            s3_key = f"{self.s3_prefix}/{rel_path}".replace('\\', '/').lstrip('/')
+            try:
+                response = self.s3_client.head_object(Bucket=self.s3_bucket, Key=s3_key)
+                s3_size = response.get('ContentLength', 0)
+                if s3_size > 0:
+                    log.info(f"S3 Object already exists: s3://{self.s3_bucket}/{s3_key} ({s3_size} bytes). Skipping.")
+                    self.db.update_download_status(url, 'completed', s3_size)
+                    return True
+            except ClientError as e:
+                if e.response.get('Error', {}).get('Code') != '404':
+                    log.warning(f"Error checking S3 object existence for {s3_key}: {e}")
+            except Exception as e:
+                log.warning(f"Error checking S3 object existence for {s3_key}: {e}")
+
+            log.info(f"Streaming PDF directly to S3: {url} -> s3://{self.s3_bucket}/{s3_key}")
+            try:
+                headers = {}
+                if referer:
+                    headers["Referer"] = referer
+                    
+                r = self.session.get(url, stream=True, timeout=30, headers=headers)
+                if r.status_code != 200:
+                    log.warning(f"Failed to download PDF {url} (Status: {r.status_code})")
+                    self.db.update_download_status(url, 'failed', error=f"HTTP Status {r.status_code}")
+                    return False
                 
-            r = self.session.get(url, stream=True, timeout=30, headers=headers)
-            if r.status_code != 200:
-                log.warning(f"Failed to download PDF {url} (Status: {r.status_code})")
-                self.db.update_download_status(url, 'failed', error=f"HTTP Status {r.status_code}")
+                content_type = r.headers.get("Content-Type", "application/pdf")
+                extra_args = {"ContentType": content_type}
+                
+                # Stream read from raw connection directly to S3
+                self.s3_client.upload_fileobj(
+                    Fileobj=r.raw,
+                    Bucket=self.s3_bucket,
+                    Key=s3_key,
+                    ExtraArgs=extra_args
+                )
+                
+                # Get the size after upload
+                try:
+                    response = self.s3_client.head_object(Bucket=self.s3_bucket, Key=s3_key)
+                    size = response.get('ContentLength', 0)
+                except Exception:
+                    size = int(r.headers.get("Content-Length", 0))
+                    
+                self.db.update_download_status(url, 'completed', size)
+                log.info(f"Direct stream upload completed successfully: s3://{self.s3_bucket}/{s3_key} ({size} bytes)")
+                return True
+                
+            except Exception as e:
+                log.error(f"Error streaming PDF {url} to S3: {e}")
+                self.db.update_download_status(url, 'failed', error=str(e))
                 return False
-                
-            with open(tmp_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        
-            # Atomic rename
-            tmp_path.rename(local_path)
-            size = local_path.stat().st_size
-            self.db.update_download_status(url, 'completed', size)
-            log.info(f"Downloaded successfully: {rel_path} ({size} bytes)")
-            return True
+        else:
+            local_path = self.output_dir / rel_path
+            local_path.parent.mkdir(parents=True, exist_ok=True)
             
-        except Exception as e:
-            log.error(f"Error downloading PDF {url}: {e}")
-            if tmp_path.exists():
-                tmp_path.unlink()  # clean up temp file
-            self.db.update_download_status(url, 'failed', error=str(e))
-            return False
+            # Skip if already exists and not empty
+            if local_path.exists() and local_path.stat().st_size > 0:
+                log.info(f"File already exists: {rel_path}. Skipping.")
+                self.db.update_download_status(url, 'completed', local_path.stat().st_size)
+                return True
+                
+            log.info(f"Downloading PDF: {url} -> {rel_path}")
+            tmp_path = local_path.with_suffix(".tmp")
+            
+            try:
+                headers = {}
+                if referer:
+                    headers["Referer"] = referer
+                    
+                r = self.session.get(url, stream=True, timeout=30, headers=headers)
+                if r.status_code != 200:
+                    log.warning(f"Failed to download PDF {url} (Status: {r.status_code})")
+                    self.db.update_download_status(url, 'failed', error=f"HTTP Status {r.status_code}")
+                    return False
+                    
+                with open(tmp_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            
+                # Atomic rename
+                tmp_path.rename(local_path)
+                size = local_path.stat().st_size
+                self.db.update_download_status(url, 'completed', size)
+                log.info(f"Downloaded successfully: {rel_path} ({size} bytes)")
+                return True
+                
+            except Exception as e:
+                log.error(f"Error downloading PDF {url}: {e}")
+                if tmp_path.exists():
+                    tmp_path.unlink()  # clean up temp file
+                self.db.update_download_status(url, 'failed', error=str(e))
+                return False
 
     def download_all_queued(self, max_workers: int, limit: int = None):
         """Downloads queued PDFs in parallel using ThreadPoolExecutor."""
@@ -635,8 +733,9 @@ class EMAPDFDownloader:
         log.info("PDF downloads finished.")
 
 # -- Additional Tables Exporter ----------------------------------------------
-def download_all_additional_tables(session: requests.Session, output_dir: Path):
-    """Downloads all 10 additional EMA Excel tables and exports them as CSVs."""
+def download_all_additional_tables(session: requests.Session, output_dir: Path,
+                                   s3_client=None, s3_bucket=None, s3_prefix=None, s3_direct=False):
+    """Downloads all 10 additional EMA Excel tables, exports them as CSVs, and optionally uploads to S3."""
     log.info("Starting download of additional regulatory tables...")
     add_dir = output_dir / "additional_tables"
     add_dir.mkdir(parents=True, exist_ok=True)
@@ -646,7 +745,20 @@ def download_all_additional_tables(session: requests.Session, output_dir: Path):
     for name, url in ADDITIONAL_TABLES.items():
         log.info(f"Processing additional table '{name}'...")
         excel_path = add_dir / f"{name}.xlsx"
+        csv_path = add_dir / f"{name}.csv"
         
+        if s3_direct:
+            csv_s3_key = f"{s3_prefix}/additional_tables/{name}.csv".replace('\\', '/').lstrip('/')
+            try:
+                s3_client.head_object(Bucket=s3_bucket, Key=csv_s3_key)
+                log.info(f"S3 Object already exists: s3://{s3_bucket}/{csv_s3_key}. Skipping table '{name}'.")
+                continue
+            except ClientError as e:
+                if e.response.get('Error', {}).get('Code') != '404':
+                    log.warning(f"Error checking S3 object existence for {csv_s3_key}: {e}")
+            except Exception as e:
+                log.warning(f"Error checking S3 object existence for {csv_s3_key}: {e}")
+
         # Download Excel
         try:
             r = session.get(url, stream=True, timeout=30)
@@ -661,27 +773,50 @@ def download_all_additional_tables(session: requests.Session, output_dir: Path):
             log.info(f"Downloaded '{name}' Excel table.")
             
             # Convert to CSV
+            parsed = False
             # Look for header row (typically row 8, similar to medicines sheet)
             try:
                 df = pd.read_excel(excel_path, header=8)
-                # Clean headers
                 df.columns = [clean_column_name(col) for col in df.columns]
-                csv_path = add_dir / f"{name}.csv"
                 df.to_csv(csv_path, index=False, encoding='utf-8')
                 log.info(f"Exported '{name}' to CSV: {csv_path}")
+                parsed = True
             except Exception as ex_parse:
                 # If row 8 fails, try row 0
                 try:
                     df = pd.read_excel(excel_path, header=0)
                     df.columns = [clean_column_name(col) for col in df.columns]
-                    csv_path = add_dir / f"{name}.csv"
                     df.to_csv(csv_path, index=False, encoding='utf-8')
                     log.info(f"Exported '{name}' to CSV (fallback header=0): {csv_path}")
+                    parsed = True
                 except Exception as ex_fallback:
                     log.error(f"Could not parse '{name}' Excel table: {ex_fallback}")
+            
+            if parsed and s3_direct:
+                csv_s3_key = f"{s3_prefix}/additional_tables/{name}.csv".replace('\\', '/').lstrip('/')
+                try:
+                    log.info(f"Uploading {name}.csv directly to S3: s3://{s3_bucket}/{csv_s3_key}")
+                    s3_client.upload_file(str(csv_path), s3_bucket, csv_s3_key)
+                    log.info(f"Successfully uploaded {name}.csv to S3.")
+                except Exception as e:
+                    log.error(f"Failed to upload {name}.csv to S3: {e}")
+                
+                # Delete temporary local files
+                if excel_path.exists():
+                    excel_path.unlink()
+                if csv_path.exists():
+                    csv_path.unlink()
                     
         except Exception as e:
-            log.error(f"Error downloading '{name}': {e}")
+            log.error(f"Error downloading/processing '{name}': {e}")
+            
+    # Clean up directory if empty
+    try:
+        if s3_direct and add_dir.exists() and not any(add_dir.iterdir()):
+            add_dir.rmdir()
+            log.info("Removed empty local 'additional_tables' directory.")
+    except Exception as e:
+        log.warning(f"Could not remove local 'additional_tables' directory: {e}")
             
     log.info("Additional regulatory tables processing complete.")
 
@@ -769,6 +904,35 @@ def main():
         action="store_true",
         help="Download and export all 10 additional EMA Excel tables (Shortages, Orphans, Referrals, etc.) to CSV."
     )
+    parser.add_argument(
+        "--s3-direct",
+        action="store_true",
+        help="Stream downloads directly to AWS S3 instead of saving to local disk."
+    )
+    parser.add_argument(
+        "--s3-bucket",
+        type=str,
+        default="moine-data",
+        help="Target S3 bucket name (default: 'moine-data')."
+    )
+    parser.add_argument(
+        "--s3-profile",
+        type=str,
+        default="moine",
+        help="AWS profile name to use from ~/.aws/credentials (default: 'moine')."
+    )
+    parser.add_argument(
+        "--s3-region",
+        type=str,
+        default="us-east-1",
+        help="AWS region (default: 'us-east-1')."
+    )
+    parser.add_argument(
+        "--s3-prefix",
+        type=str,
+        default="ema_data",
+        help="S3 prefix/folder path under which to save documents (default: 'ema_data')."
+    )
     
     args = parser.parse_args()
     
@@ -798,8 +962,34 @@ def main():
     # Build HTTP Session
     session = build_session(args.max_retries)
     
+    # Initialize S3 if direct download is enabled
+    s3_client = None
+    if args.s3_direct:
+        if boto3 is None:
+            log.error("The 'boto3' library is required for S3 upload. Install it with: pip install boto3")
+            sys.exit(1)
+        try:
+            log.info(f"Initializing AWS S3 Client (Profile: {args.s3_profile}, Region: {args.s3_region})...")
+            s3_session = boto3.Session(profile_name=args.s3_profile, region_name=args.s3_region)
+            s3_client = s3_session.client("s3")
+            # Verify bucket existence
+            try:
+                s3_client.head_bucket(Bucket=args.s3_bucket)
+                log.info(f"AWS S3 connection verified for bucket: {args.s3_bucket}")
+            except Exception as bucket_err:
+                log.warning(f"Could not verify bucket '{args.s3_bucket}' via head_bucket (could be permission constraints). Proceeding. Error: {bucket_err}")
+        except Exception as e:
+            log.error(f"Failed to initialize S3 session: {e}")
+            sys.exit(1)
+            
     # Step 1: Download & Parse Master Excel
-    collector = EMADataCollector(db, session, output_dir, langs)
+    collector = EMADataCollector(
+        db, session, output_dir, langs,
+        s3_client=s3_client,
+        s3_bucket=args.s3_bucket,
+        s3_prefix=args.s3_prefix,
+        s3_direct=args.s3_direct
+    )
     success = collector.download_and_parse_master()
     if not success:
         log.error("Failed to download or parse master medicines Excel. Exiting.")
@@ -807,20 +997,56 @@ def main():
         
     # Optional: Download all additional tables
     if args.download_all_tables:
-        download_all_additional_tables(session, output_dir)
+        download_all_additional_tables(
+            session, output_dir,
+            s3_client=s3_client,
+            s3_bucket=args.s3_bucket,
+            s3_prefix=args.s3_prefix,
+            s3_direct=args.s3_direct
+        )
         
     # Step 2: Crawl individual EPAR pages for PDF links
     collector.crawl_all_medicines(max_workers=args.threads, limit=args.limit_medicines)
     
     # Step 3: Download queued PDFs (if not skipped)
     if not args.skip_pdfs:
-        downloader = EMAPDFDownloader(db, session, output_dir)
+        downloader = EMAPDFDownloader(
+            db, session, output_dir,
+            s3_client=s3_client,
+            s3_bucket=args.s3_bucket,
+            s3_prefix=args.s3_prefix,
+            s3_direct=args.s3_direct
+        )
         downloader.download_all_queued(max_workers=args.threads, limit=args.limit_downloads)
     else:
         log.info("Skipping PDF downloads as --skip-pdfs was specified.")
         
     # Step 4: Export metadata from database to CSV
     export_documents_metadata(db, output_dir)
+    
+    # Upload metadata database and CSVs to S3 at the end of the run
+    if args.s3_direct:
+        csv_path = output_dir / "ema_documents.csv"
+        if csv_path.exists():
+            try:
+                csv_key = f"{args.s3_prefix}/ema_documents.csv".replace('\\', '/').lstrip('/')
+                log.info(f"Uploading ema_documents.csv to S3: s3://{args.s3_bucket}/{csv_key}")
+                s3_client.upload_file(str(csv_path), args.s3_bucket, csv_key)
+                log.info("Successfully uploaded ema_documents.csv to S3.")
+                csv_path.unlink()
+                log.info("Removed local copy of ema_documents.csv.")
+            except Exception as e:
+                log.error(f"Failed to upload documents metadata to S3: {e}")
+                
+        db_path = output_dir / "ema_database.db"
+        if db_path.exists():
+            try:
+                db_key = f"{args.s3_prefix}/ema_database.db".replace('\\', '/').lstrip('/')
+                log.info(f"Uploading backup of ema_database.db to S3: s3://{args.s3_bucket}/{db_key}")
+                s3_client.upload_file(str(db_path), args.s3_bucket, db_key)
+                log.info("Successfully uploaded database backup to S3.")
+            except Exception as e:
+                log.error(f"Failed to upload database backup to S3: {e}")
     
     log.info("EMA Downloader process completed successfully.")
 
